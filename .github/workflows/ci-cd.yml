@@ -53,6 +53,7 @@ jobs:
           echo "${{secrets.SSH_PRIVATE_KEY}}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.SERVER_HOST}} >> ~/.ssh/known_hosts
+
       - name: Check if Docker is installed
         id: check-docker
         run: |
@@ -89,18 +90,18 @@ jobs:
           EOF
           
           
-          - name: Install Node.js on EC2
-            if: steps.check-nodejs.outputs.node_exists == 'false'
-            run: |
-              ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-                curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-                sudo apt-get install -y nodejs
-              EOF
+      - name: Install Node.js on EC2
+        if: steps.check-nodejs.outputs.node_exists == 'false'
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          EOF
 
-          - name: Deploy to EC2 via Docker Compose
-            run: |
-              ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-                cd /home/${{ secrets.SERVER_USER }}/backend
-                docker compose pull
-                docker compose up -d
-              EOF
+      - name: Deploy to EC2 via Docker Compose
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd /home/${{ secrets.SERVER_USER }}/backend
+            docker compose pull
+            docker compose up -d
+          EOF
