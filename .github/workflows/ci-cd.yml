@@ -27,20 +27,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Set up SSH
+        env:
+          # Secrets를 직접 run 스크립트에 넣지 않고 환경 변수로 매핑하는 것이 훨씬 안전합니다.
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
         run: |
           mkdir -p ~/.ssh
-          # cat << EOF 방식보다는 echo로 직접 넣는 것이 YAML에서 오류 가능성이 적습니다.
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          
+          # 환경 변수를 사용하여 키 파일 생성 (따옴표/줄바꿈 문제 해결)
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+          
+          # 호스트 주소가 있는지 확인 (디버깅 용도)
+          if [ -z "$SERVER_HOST" ]; then
+            echo "Error: SERVER_HOST secret is empty."
+            exit 1
+          fi
+          
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
 
-      # [수정됨] 이 부분의 들여쓰기가 잘못되어 있었습니다. steps 아래로 정렬했습니다.
       - name: Deploy to EC2
+        env:
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
         run: |
-          # ssh 접속을 위한 heredoc 식별자를 EOF 대신 ENDSSH로 변경하여 내부 스크립트와 구분을 명확히 했습니다.
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' << 'ENDSSH'
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa $SERVER_USER@$SERVER_HOST 'bash -s' << 'ENDSSH'
             set -e
-            cd /home/${{ secrets.SERVER_USER }}/bluegreen
+            cd /home/$USER/bluegreen # $USER 변수를 사용하거나 secrets.SERVER_USER 값을 직접 사용
           
             # 현재 실행 중인 컨테이너 확인 (Blue/Green 결정)
             if docker ps | grep -q express-healthcheck-blue; then
@@ -65,14 +78,13 @@ jobs:
               echo "Running health check..."
               for i in {1..10}; do
                 sleep 2
-                # curl 명령어가 실패하지 않도록 || true 처리를 하거나 if문에 직접 넣습니다.
                 if docker exec express-healthcheck-$TARGET curl -s -f http://localhost:3000/health > /dev/null; then
                   echo "Health check passed"
                   break
                 elif [ $i -eq 10 ]; then
                   echo "Health check failed. Rolling back..."
                   docker stop express-healthcheck-$TARGET
-                  docker compose start $STOP # restart 대신 start가 안전할 수 있습니다
+                  docker compose start $STOP
                   exit 1
                 fi
               done
@@ -81,10 +93,9 @@ jobs:
             fi
           
             echo "Switching Nginx to $TARGET"
-            # nginx.conf 수정 (정규식 패턴 약간 보완)
             sed -i "s/express-healthcheck-[a-z]*/express-healthcheck-$TARGET/g" nginx.conf
           
-            # Nginx 재시작 (Zero downtime을 위해 reload 권장하지만, docker-compose 구성에 따라 restart 사용)
+            # Nginx 재시작
             if docker ps | grep -q nginx-proxy; then
                 docker compose restart nginx-proxy
             else
