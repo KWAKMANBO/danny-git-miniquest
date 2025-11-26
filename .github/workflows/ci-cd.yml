@@ -32,59 +32,53 @@ jobs:
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
-
       - name: Deploy to EC2
         run: |
-           ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' <<EOF
-           set -e
-           cd /home/${{ secrets.SERVER_USER }}/bluegreen
-      # 현재 어떤 버전(blue/green)이 실행 중인지 확인해 다음 배포 대상(TARGET)과 종료할 기존 버전(STOP)을 결정
-           if docker ps | grep express-healthcheck-blue; then
-           TARGET=green # blue가 실행 중이면 새 버전은 green에 배포
-           STOP=express-healthcheck-blue # 배포 완료 후 종료할 환경은 blue
-           elif docker ps | grep express-healthcheck-green; then
-           TARGET=blue # green이 실행 중이면 새 버전은 blue에 배포
-           STOP=express-healthcheck-green # 배포 완료 후 종료할 환경은 green
-           else
-           TARGET=blue # 첫 배포라면 blue 환경을 기본 타겟으로 사용
-           STOP=none # 기존 환경이 없으므로 종료할 환경도 없음
-           fi
+          ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' << 'EOF'
+          set -e
+          cd /home/${{ secrets.SERVER_USER }}/bluegreen
 
-           echo "Deploying to: \$TARGET"
-      # 새 버전의 컨테이너 이미지를 가져오고(TARGET 환경)
-           docker compose pull express-healthcheck-\$TARGET
-      # 기존 버전과 독립된 대상 환경(TARGET)에 새 버전 컨테이너를 실행
-           docker compose up -d express-healthcheck-\$TARGET
-           
-           if [ "\$STOP" != "none" ]; then
-           echo "Running health check..."
-           for i in {1..10}; do
-           sleep 2
-           if docker exec express-healthcheck-\$TARGET curl -s http://localhost:3000/health; then
-           echo "Health check passed"
-           break
-           elif [ \$i -eq 10 ]; then
-           echo "Health check failed. Rolling back..."
-           docker stop express-healthcheck-\$TARGET
-           docker compose restart \$STOP
-           exit 1
-           fi
-           done
-           else
-           echo "First deploy — skipping health check"
-           fi
-           
-           echo "Switching Nginx to \$TARGET"
-      # Nginx 설정 파일에서 upstream 대상으로 사용되는 컨테이너 이름을
-      # express-healthcheck-blue 또는 express-healthcheck-green → $TARGET 으로 치환
-           sed -i "s/express-healthcheck-[a-z]\\+/express-healthcheck-\$TARGET/g" nginx.conf
-      # Nginx 프록시를 재시작하여 트래픽을 새로운 환경($TARGET)으로 전환
-           docker stop nginx-proxy || true
-           docker rm -f nginx-proxy || true
-           docker compose up -d nginx-proxy
-      
-      # 기존 환경(STOP)이 있다면(첫 배포가 아닐 때), 트래픽 전환 후 종료
-           if [ "\$STOP" != "none" ]; then
-           docker stop \$STOP || true # 더 이상 사용하지 않는 환경 안전 종료
-           fi
-           EOF
+          if docker ps | grep express-healthcheck-blue; then
+            TARGET=green
+            STOP=express-healthcheck-blue
+          elif docker ps | grep express-healthcheck-green; then
+            TARGET=blue
+            STOP=express-healthcheck-green
+          else
+            TARGET=blue
+            STOP=none
+          fi
+
+          echo "Deploying to: $TARGET"
+
+          docker compose pull express-healthcheck-$TARGET
+          docker compose up -d express-healthcheck-$TARGET
+
+          if [ "$STOP" != "none" ]; then
+            echo "Running health check..."
+            for i in {1..10}; do
+              sleep 2
+              if docker exec express-healthcheck-$TARGET curl -s http://localhost:3000/health; then
+                echo "Health check passed"
+                break
+              elif [ $i -eq 10 ]; then
+                echo "Health check failed. Rolling back..."
+                docker stop express-healthcheck-$TARGET
+                docker compose restart $STOP
+                exit 1
+              fi
+            done
+          else
+            echo "First deploy — skipping health check"
+          fi
+
+          echo "Switching Nginx to $TARGET"
+          sed -i "s/express-healthcheck-[a-z]\+/express-healthcheck-$TARGET/g" nginx.conf
+          docker stop nginx-proxy || true
+          docker rm -f nginx-proxy || true
+          docker compose up -d nginx-proxy
+
+          if [ "$STOP" != "none" ]; then
+            docker stop $STOP || true
+          fi
+          EOF
