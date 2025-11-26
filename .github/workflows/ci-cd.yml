@@ -29,59 +29,70 @@ jobs:
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          cat << 'EOF' > ~/.ssh/id_rsa
-  ${{ secrets.SSH_PRIVATE_KEY }}
-  EOF
-  chmod 600 ~/.ssh/id_rsa
-  ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+          # cat << EOF 방식보다는 echo로 직접 넣는 것이 YAML에서 오류 가능성이 적습니다.
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
-- name: Deploy to EC2
-  run: |
-    ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' << 'EOF'
-    set -e
-    cd /home/${{ secrets.SERVER_USER }}/bluegreen
-    
-    if docker ps | grep express-healthcheck-blue; then
-      TARGET=green
-      STOP=express-healthcheck-blue
-    elif docker ps | grep express-healthcheck-green; then
-      TARGET=blue
-      STOP=express-healthcheck-green
-    else
-      TARGET=blue
-      STOP=none
-    fi
-    
-    echo "Deploying to: $TARGET"
-    
-    docker compose pull express-healthcheck-$TARGET
-    docker compose up -d express-healthcheck-$TARGET
-    
-    if [ "$STOP" != "none" ]; then
-      echo "Running health check..."
-      for i in {1..10}; do
-        sleep 2
-        if docker exec express-healthcheck-$TARGET curl -s http://localhost:3000/health; then
-          echo "Health check passed"
-          break
-        elif [ $i -eq 10 ]; then
-          echo "Health check failed. Rolling back..."
-          docker stop express-healthcheck-$TARGET
-          docker compose restart $STOP
-          exit 1
-        fi
-      done
-    else
-      echo "First deploy — skipping health check"
-    fi
-    
-    echo "Switching Nginx to $TARGET"
-    sed -i "s/express-healthcheck-[a-z]\+/express-healthcheck-$TARGET/g" nginx.conf
-    docker stop nginx-proxy || true
-    docker rm -f nginx-proxy || true
-    docker compose up -d nginx-proxy
-    
-    if [ "$STOP" != "none" ]; then
-      docker stop $STOP || true
-    fi
-  EOF
+      # [수정됨] 이 부분의 들여쓰기가 잘못되어 있었습니다. steps 아래로 정렬했습니다.
+      - name: Deploy to EC2
+        run: |
+          # ssh 접속을 위한 heredoc 식별자를 EOF 대신 ENDSSH로 변경하여 내부 스크립트와 구분을 명확히 했습니다.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' << 'ENDSSH'
+            set -e
+            cd /home/${{ secrets.SERVER_USER }}/bluegreen
+          
+            # 현재 실행 중인 컨테이너 확인 (Blue/Green 결정)
+            if docker ps | grep -q express-healthcheck-blue; then
+              TARGET=green
+              STOP=express-healthcheck-blue
+            elif docker ps | grep -q express-healthcheck-green; then
+              TARGET=blue
+              STOP=express-healthcheck-green
+            else
+              TARGET=blue
+              STOP=none
+            fi
+          
+            echo "Deploying to: $TARGET"
+          
+            # 이미지 Pull 및 실행
+            docker compose pull express-healthcheck-$TARGET
+            docker compose up -d express-healthcheck-$TARGET
+          
+            # 헬스 체크
+            if [ "$STOP" != "none" ]; then
+              echo "Running health check..."
+              for i in {1..10}; do
+                sleep 2
+                # curl 명령어가 실패하지 않도록 || true 처리를 하거나 if문에 직접 넣습니다.
+                if docker exec express-healthcheck-$TARGET curl -s -f http://localhost:3000/health > /dev/null; then
+                  echo "Health check passed"
+                  break
+                elif [ $i -eq 10 ]; then
+                  echo "Health check failed. Rolling back..."
+                  docker stop express-healthcheck-$TARGET
+                  docker compose start $STOP # restart 대신 start가 안전할 수 있습니다
+                  exit 1
+                fi
+              done
+            else
+              echo "First deploy — skipping health check"
+            fi
+          
+            echo "Switching Nginx to $TARGET"
+            # nginx.conf 수정 (정규식 패턴 약간 보완)
+            sed -i "s/express-healthcheck-[a-z]*/express-healthcheck-$TARGET/g" nginx.conf
+          
+            # Nginx 재시작 (Zero downtime을 위해 reload 권장하지만, docker-compose 구성에 따라 restart 사용)
+            if docker ps | grep -q nginx-proxy; then
+                docker compose restart nginx-proxy
+            else
+                docker compose up -d nginx-proxy
+            fi
+          
+            # 이전 컨테이너 중지
+            if [ "$STOP" != "none" ]; then
+              docker stop $STOP || true
+            fi
+          ENDSSH
