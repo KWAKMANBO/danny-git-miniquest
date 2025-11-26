@@ -1,107 +1,90 @@
-name: Node.js CI/CD
+name: Express Blue/Green CI/CD
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
 
 jobs:
-  test:
+  build-and-push:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [ 19.x,20.x,22.x ]
-
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
-        with:
-          node-version: ${{ matrix.node-version }}
-      - name: Install dependencies
-        run: npm install
-      - name: Run tests
-        run: npm test
 
-  build-and-push-images:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - uses: actions/checkout@v2
       - name: Docker Hub Login
         uses: docker/login-action@v3
         with:
-          username: ${{secrets.DOCKER_USERNAME}}
-          password: ${{secrets.DOCKER_TOKEN}}
-      - name: Build and Push Docker Image
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build and Push Image
         run: |
-          docker build --platform linux/amd64 -t ${{ secrets.DOCKER_USERNAME}}/express-hello-world:latest .
-          docker push ${{secrets.DOCKER_USERNAME}}/express-hello-world:latest
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/express-healthcheck:latest .
+          docker push ${{ secrets.DOCKER_USERNAME }}/express-healthcheck:latest
 
   deploy:
-    needs: build-and-push-images
+    needs: build-and-push
     runs-on: ubuntu-latest
-
     steps:
-      - name: Prepare SSH Key
+      - name: Set up SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{secrets.SSH_PRIVATE_KEY}}" > ~/.ssh/id_rsa
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.SERVER_HOST}} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Check if Docker is installed
-        id: check-docker
+      - name: Deploy to EC2
         run: |
-          DOCKER_EXISTS=$(ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER}}@${{secrets.SERVER_HOST}} 'command -v docker > /dev/null && echo "true" || echo "false"')
-          echo "docker_exist=$DOCKER_EXISTS" >> $GITHUB_OUTPUT
-
-      - name: Check if Node.js is installed
-        id: check-nodejs
-        run: |
-          NODE_EXISTS=$(ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'command -v node >/dev/null && echo "true" || echo "false"')
-          echo "node_exists=$NODE_EXISTS" >> $GITHUB_OUTPUT
-
-      - name: Install Docker on EC2
-        if: steps.check-docker.outputs.docker_exists == 'false'
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{secrets.SERVER_USER}}@${{secrets.SERVER_HOST}} << 'EOF'
-          sudo apt-get update
-          sudo apt-get install -y \
-          ca-certificates \
-          curl \
-          gnupg \
-          lsb-realese
-          sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-              | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            echo \
-              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-              https://download.docker.com/linux/ubuntu \
-              $(lsb_release -cs) stable" \
-              | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-            sudo apt-get update
-            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-            sudo usermod -aG docker $USER
-          EOF
+               ssh -i ~/.ssh/id_rsa ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'bash -s' <<EOF
+               set -e
+               cd /home/${{ secrets.SERVER_USER }}/bluegreen
+          # 현재 어떤 버전(blue/green)이 실행 중인지 확인해 다음 배포 대상(TARGET)과 종료할 기존 버전(STOP)을 결정
+               if docker ps | grep express-healthcheck-blue; then
+               TARGET=green # blue가 실행 중이면 새 버전은 green에 배포
+               STOP=express-healthcheck-blue # 배포 완료 후 종료할 환경은 blue
+               elif docker ps | grep express-healthcheck-green; then
+               TARGET=blue # green이 실행 중이면 새 버전은 blue에 배포
+               STOP=express-healthcheck-green # 배포 완료 후 종료할 환경은 green
+               else
+               TARGET=blue # 첫 배포라면 blue 환경을 기본 타겟으로 사용
+               STOP=none # 기존 환경이 없으므로 종료할 환경도 없음
+               fi
+               
+               echo "Deploying to: \$TARGET"
+          # 새 버전의 컨테이너 이미지를 가져오고(TARGET 환경)
+               docker compose pull express-healthcheck-\$TARGET
+          # 기존 버전과 독립된 대상 환경(TARGET)에 새 버전 컨테이너를 실행
+               docker compose up -d express-healthcheck-\$TARGET
+               
+               if [ "\$STOP" != "none" ]; then
+               echo "Running health check..."
+               for i in {1..10}; do
+               sleep 2
+               if docker exec express-healthcheck-\$TARGET curl -s http://localhost:3000/health; then
+               echo "Health check passed"
+               break
+               elif [ \$i -eq 10 ]; then
+               echo "Health check failed. Rolling back..."
+               docker stop express-healthcheck-\$TARGET
+               docker compose restart \$STOP
+               exit 1
+               fi
+               done
+               else
+               echo "First deploy — skipping health check"
+               fi
+               
+               echo "Switching Nginx to \$TARGET"
+          # Nginx 설정 파일에서 upstream 대상으로 사용되는 컨테이너 이름을
+          # express-healthcheck-blue 또는 express-healthcheck-green → $TARGET 으로 치환
+               sed -i "s/express-healthcheck-[a-z]\\+/express-healthcheck-\$TARGET/g" nginx.conf
+          # Nginx 프록시를 재시작하여 트래픽을 새로운 환경($TARGET)으로 전환
+               docker stop nginx-proxy || true
+               docker rm -f nginx-proxy || true
+               docker compose up -d nginx-proxy
           
-          
-      - name: Install Node.js on EC2
-        if: steps.check-nodejs.outputs.node_exists == 'false'
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-            sudo apt-get install -y nodejs
-          EOF
-
-      - name: Deploy to EC2 via Docker Compose
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
-            cd /home/${{ secrets.SERVER_USER }}/backend
-            docker compose pull
-            docker compose up -d
-          EOF
+          # 기존 환경(STOP)이 있다면(첫 배포가 아닐 때), 트래픽 전환 후 종료
+               if [ "\$STOP" != "none" ]; then
+               docker stop \$STOP || true # 더 이상 사용하지 않는 환경 안전 종료
+               fi
+               EOF
